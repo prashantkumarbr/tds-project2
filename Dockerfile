@@ -5,7 +5,7 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
-# Install system dependencies required by Playwright browsers
+# Install Playwright system dependencies for Debian 13 (Trixie)
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
@@ -23,7 +23,7 @@ RUN apt-get update && apt-get install -y \
     libpangocairo-1.0-0 \
     libpango-1.0-0 \
     libgtk-3-0 \
-    libgdk-pixbuf2.0-0 \
+    libgdk-pixbuf-2.0-0 \
     libgbm1 \
     libxshmfence1 \
     libdrm2 \
@@ -41,19 +41,15 @@ RUN apt-get update && apt-get install -y \
     xdg-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
+# Install Python deps
 COPY requirements.txt .
-
-# Remove playwright from requirements (will install separately)
 RUN sed -i '/playwright/d' requirements.txt
-
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir playwright
 
-# Install browsers (Chromium + Firefox + Webkit)
-RUN playwright install --with-deps chromium firefox webkit
+# Install browsers (Chromium, Firefox, WebKit)
+RUN playwright install --with-deps
 
-# Add application
 COPY . .
 
 EXPOSE 10000
