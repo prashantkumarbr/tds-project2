@@ -379,157 +379,132 @@ def extract_clean_answer(llm_response: str, expected_type: str = "string") -> An
 # ==================== TASK SOLVING ====================
 
 async def solve_task_direct(task_text: str, urls: dict, base_url: str, html_content: str) -> Any:
-    """Directly solve task without analysis step - faster and more reliable"""
-    
+    """
+    Direct solver for quizzes with scraping, CSV, PDF, JSON handling.
+    Prioritizes deterministic logic over LLM.
+    """
+
     data_context = ""
-    
-    # 1. Process API URLs (scrape data from pages) - Use browser for JS rendering
+
+    # ============================================================
+    # 0. Detect cutoff FIRST (for all CSV)
+    # ============================================================
+    cutoff_match = re.search(r'[Cc]utoff[:\s]*(\d+)', task_text)
+    cutoff_value = int(cutoff_match.group(1)) if cutoff_match else None
+
+    # ============================================================
+    # 1. Process API URLs (scrape extra data)
+    # ============================================================
     for api_url in urls.get("api_urls", []):
         try:
-            logger.info(f"Scraping: {api_url}")
-            
-            # Use browser to render JavaScript
             scraped_text, scraped_html = await fetch_and_render_page(api_url)
-            logger.info(f"📄 Scraped content: {scraped_text[:200]}")
-            logger.info(f"🔍 Full scraped text for debugging: {scraped_text}")  # Log full content for debugging
-            
-            # Direct secret extraction - try multiple patterns
-            secret_patterns = [
-                r'secret[:\s]*([a-zA-Z0-9]{6,20})',
-                r'code[:\s]*([a-zA-Z0-9]{6,20})',
-                r'key[:\s]*([a-zA-Z0-9]{6,20})',
-                r'\b([a-f0-9]{6,20})\b',  # Hex string
-                r'\b([A-Z0-9]{6,20})\b',  # Alphanumeric uppercase
-            ]
-            
-            for pattern in secret_patterns:
-                secret_match = re.search(pattern, scraped_text, re.I)
-                if secret_match:
-                    secret = secret_match.group(1).strip()
-                    # Avoid false positives
-                    if secret.lower() not in ['secret', 'code', 'key', 'email', 'answer']:
-                        logger.info(f"✓ Extracted secret: {secret}")
-                        return secret
-            
+
+            # Try to extract secret directly
+            match = re.search(r"code is (\d+)", scraped_text)
+            if match:
+                return int(match.group(1))
+
             data_context += f"\n\n=== Scraped from {api_url} ===\n{scraped_text}"
+
         except Exception as e:
             logger.error(f"Error scraping {api_url}: {e}")
-    
-    # 2. Download and process files
-    if not urls.get("file_urls"):
-        # Try to find file references in the task text itself
-        logger.info("🔍 No file URLs found, checking task text for file references")
-        
-        # Look for patterns like "CSV file" or mentions of data files
-        if re.search(r'\bCSV\b|\bcsv file\b|\bdata.*file\b', task_text, re.I):
-            logger.info("📊 Task mentions CSV/data file - attempting to locate")
-            
-            # Try common file locations based on current URL
-            parsed = urlparse(base_url)
-            base_domain = f"{parsed.scheme}://{parsed.netloc}"
-            
-            # Extract any identifiers from the URL (like email, id)
-            url_params = re.findall(r'[\?&](email|id)=([^&]+)', base_url)
-            param_dict = {k: v for k, v in url_params}
-            
-            # Try common file naming patterns
-            potential_files = []
-            if 'email' in param_dict and 'id' in param_dict:
-                # Pattern: /demo-audio-data.csv or /demo-audio-123.csv
-                page_name = parsed.path.split('/')[-1].split('?')[0]
-                potential_files.extend([
-                    f"{base_domain}/{page_name}-data.csv",
-                    f"{base_domain}/{page_name}.csv",
-                    f"{base_domain}/data-{param_dict.get('id')}.csv",
-                    f"{base_domain}/{page_name}-{param_dict.get('id')}.csv",
-                ])
-            
-            # Try to download from potential locations
-            for potential_url in potential_files:
-                try:
-                    logger.info(f"🔍 Trying: {potential_url}")
-                    file_data, content_type = await download_file(potential_url)
-                    logger.info(f"✅ Found CSV at: {potential_url}")
-                    urls["file_urls"].append(potential_url)
-                    break
-                except Exception:
-                    continue
-    
+
+    # ============================================================
+    # 2. Process FILE URLs
+    # ============================================================
     for file_url in urls.get("file_urls", []):
         try:
-            logger.info(f"Downloading: {file_url}")
             file_data, content_type = await download_file(file_url)
-            
-            if "pdf" in content_type or file_url.lower().endswith(".pdf"):
+
+            # ---------- CSV ----------
+            if "csv" in content_type or file_url.lower().endswith(".csv"):
+                import pandas as pd
+
+                # ALWAYS read CSV without header
+                df = pd.read_csv(BytesIO(file_data), header=None)
+
+                logger.info(f"📊 CSV Shape: {df.shape}")
+                logger.info(f"📊 Header forced: False")
+                logger.info(f"📊 Cutoff: {cutoff_value}")
+
+                # One-column CSV (Demo Audio case)
+                if df.shape[1] == 1:
+                    values = pd.to_numeric(df.iloc[:, 0], errors='coerce')
+
+                    if cutoff_value:
+                        values = values[values > cutoff_value]
+
+                    csv_answer = int(values.sum())
+                    logger.info(f"✓ CSV computed answer: {csv_answer}")
+                    return csv_answer
+
+                # Multi-column fallback (rare)
+                else:
+                    csv_preview = df.head(10).to_json()
+                    instructions_prompt = f"""
+TASK: {task_text}
+
+CSV PREVIEW:
+{csv_preview}
+
+Return JSON:
+{{
+ "column": 0,
+ "operation": "sum",
+ "filter": ">",
+ "cutoff": {cutoff_value}
+}}
+"""
+                    llm_resp = await call_aipipe_llm(instructions_prompt)
+                    try:
+                        instr = json.loads(llm_resp)
+                    except:
+                        return None
+
+                    col = instr.get("column", 0)
+                    series = pd.to_numeric(df.iloc[:, col], errors='coerce')
+
+                    if instr.get("filter") == ">" and instr.get("cutoff"):
+                        series = series[series > instr["cutoff"]]
+
+                    if instr.get("operation") == "sum":
+                        return int(series.sum())
+
+                    return None
+
+            # ---------- PDF ----------
+            elif "pdf" in content_type or file_url.endswith(".pdf"):
                 pdf_text = await extract_text_from_pdf(file_data)
-                data_context += f"\n\n=== PDF: {file_url} ===\n{pdf_text}"
-            
-            elif "csv" in content_type or file_url.lower().endswith(".csv"):
-                import pandas as pd
-                df = pd.read_csv(BytesIO(file_data))
-                
-                # Look for cutoff value in task
-                cutoff_match = re.search(r'[Cc]utoff[:\s]*(\d+)', task_text)
-                cutoff_value = int(cutoff_match.group(1)) if cutoff_match else None
-                
-                if cutoff_value:
-                    logger.info(f"📊 Cutoff detected: {cutoff_value}")
-                
-                data_context += f"\n\n=== CSV: {file_url} ===\nShape: {df.shape}\nColumns: {list(df.columns)}\n"
-                
-                if cutoff_value:
-                    data_context += f"Cutoff value: {cutoff_value}\n"
-                
-                data_context += f"First rows:\n{df.head(10).to_string()}\n\nLast rows:\n{df.tail(5).to_string()}\n\nSummary:\n{df.describe().to_string()}"
-            
-            elif "excel" in content_type or file_url.lower().endswith((".xlsx", ".xls")):
-                import pandas as pd
-                df = pd.read_excel(BytesIO(file_data))
-                data_context += f"\n\n=== Excel: {file_url} ===\nShape: {df.shape}\nColumns: {list(df.columns)}\nFirst rows:\n{df.head(10).to_string()}\n\nSummary:\n{df.describe().to_string()}"
-            
-            elif "json" in content_type or file_url.lower().endswith(".json"):
-                json_data = json.loads(file_data.decode('utf-8'))
-                data_context += f"\n\n=== JSON: {file_url} ===\n{json.dumps(json_data, indent=2)[:3000]}"
-            
+                data_context += f"\n\n=== PDF ===\n{pdf_text}"
+
+            # ---------- JSON ----------
+            elif "json" in content_type or file_url.endswith(".json"):
+                j = json.loads(file_data.decode())
+                data_context += f"\n\n=== JSON ===\n{json.dumps(j, indent=2)}"
+
         except Exception as e:
-            logger.error(f"Error processing {file_url}: {e}")
-    
-    # 3. Build solving prompt
-    solve_prompt = f"""You are a data analysis expert. Solve this task and provide ONLY the final answer value.
+            logger.error(f"Error processing file {file_url}: {e}")
+
+    # ============================================================
+    # 3. Final fallback → LLM (if no CSV, no scrape, etc.)
+    # ============================================================
+    solve_prompt = f"""
+Solve this task. Provide ONLY the final answer.
 
 TASK:
 {task_text}
 
 DATA:
-{data_context if data_context else "No external data provided - answer from task description"}
+{data_context}
 
-IMPORTANT INSTRUCTIONS:
-- Read the task VERY carefully
-- If there's a CSV with data and a cutoff value, you likely need to filter or sum based on that cutoff
-- Common operations: sum, count, filter, aggregate
-- Return ONLY the final numeric answer or text value
-- NO explanations, NO "Answer:", NO extra words
-- Just the value: e.g., 12345 or abc123
-
-YOUR ANSWER:"""
+Your answer:
+"""
 
     llm_response = await call_aipipe_llm(solve_prompt)
-    
-    if not llm_response:
-        logger.error("Empty response from LLM")
-        return "Unable to determine answer"
-    
-    # Determine expected type from task
-    expected_type = "string"
-    if re.search(r'\bsum\b|\btotal\b|\bcount\b|\bnumber\b', task_text, re.I):
-        expected_type = "number"
-    elif re.search(r'\btrue\b|\bfalse\b|\bboolean\b', task_text, re.I):
-        expected_type = "boolean"
-    
-    answer = extract_clean_answer(llm_response, expected_type)
-    logger.info(f"✓ Final answer: {answer} (type: {type(answer).__name__})")
-    
-    return answer
+    logger.info(f"LLM fallback: {llm_response}")
+    return extract_clean_answer(llm_response)
+
+
 
 # ==================== QUIZ CHAIN HANDLER ====================
 
