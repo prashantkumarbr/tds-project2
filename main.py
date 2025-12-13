@@ -578,47 +578,18 @@ async def handle_embeddings_task(json_data: dict, task_text: str) -> str:
     """
     logger.info("🔢 Embeddings task detected")
 
-    text = task_text.lower()
+    
+    prompt = f"""
+        Task:
+        {task_text}
 
-    # This task is rule-based, not an embeddings computation task
-    if "email length" not in text:
-        # fallback: ambiguous task → LLM allowed
-        return (await call_aipipe_llm(task_text)).strip()
+        My email {YOUR_EMAIL}.
 
-    email_length = len(YOUR_EMAIL)
-    is_even = (email_length % 2 == 0)
+        Decide the correct submission strictly based on the instructions.
+        Return ONLY the answer.
+        """
 
-    # Extract explicit rules
-    even_match = re.search(
-        r'if\s+your\s+email\s+length\s+is\s+even.*?submit\s+ids?\s+([a-z0-9,\s]+)',
-        text
-    )
-
-    odd_match = re.search(
-        r'if\s+your\s+email\s+length\s+is\s+odd.*?submit\s+ids?\s+([a-z0-9,\s]+)',
-        text
-    )
-
-    if not even_match or not odd_match:
-        raise ValueError("Could not parse even/odd rules from task text")
-
-    def normalize(s: str) -> str:
-        return ",".join(
-            part.strip()
-            for part in s.replace(" ", "").split(",")
-            if part.strip()
-        )
-
-    even_answer = normalize(even_match.group(1))
-    odd_answer = normalize(odd_match.group(1))
-
-    result = even_answer if is_even else odd_answer
-
-    logger.info(
-        f"📧 Email length={email_length} ({'even' if is_even else 'odd'}) → {result}"
-    )
-
-    return result
+    return (await call_aipipe_llm(prompt)).strip()
 
     
 # Shards Task Handler - Return proper JSON object
